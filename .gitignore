@@ -1,0 +1,30 @@
+# datasets
+Mayo_2020_Simulated/
+data/
+
+# outputs
+outputs/
+logs/
+
+# checkpoints
+*.pth
+*.pt
+
+# cache
+__pycache__/
+*.pyc
+
+# env
+ldct_mamba/
+.env
+
+# system
+.DS_Store
+
+TotalSegmentator/
+third_party/
+wheels/
+
+
+
+

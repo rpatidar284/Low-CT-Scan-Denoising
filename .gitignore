@@ -1,5 +1,5 @@
 # datasets
-Mayo_2020_Simulated/
+
 data/
 
 # outputs
@@ -20,10 +20,6 @@ ldct_mamba/
 
 # system
 .DS_Store
-
-TotalSegmentator/
-third_party/
-wheels/
 
 
 

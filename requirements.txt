@@ -1,9 +1,8 @@
-torch>=2.2
-torchvision>=0.17
-numpy>=1.24
-scipy>=1.10
-scikit-image>=0.22
-tqdm>=4.66
-pyyaml>=6.0
-nibabel>=5.1
-SimpleITK>=2.3
+torch>=2.0.0
+torchvision
+numpy
+pyyaml
+SimpleITK
+nibabel
+einops
+timm

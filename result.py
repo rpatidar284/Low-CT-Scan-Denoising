@@ -123,3 +123,130 @@
 # TOTAL           | 18254      | 18254
 # ========================================================================================================================
 
+#============================================================
+# models/vm_unet.py — VMUNetEncoder self-test
+# ============================================================
+# Device : cuda
+
+# Total parameters     : 9,573,312
+# Trainable parameters : 9,573,312
+
+# ── Forward pass ──────────────────────────────────────────────
+#   Input           : [2, 1, 512, 512]
+#   bottleneck (F)  : [2, 768, 16, 16]
+#   skip1           : [2, 96, 128, 128]
+#   skip2           : [2, 192, 64, 64]
+#   skip3           : [2, 384, 32, 32]
+
+# ── Shape assertions ──────────────────────────────────────────
+#   bottleneck (2,768,16,16)   ✓
+#   skip1      (2,96,128,128)  ✓
+#   skip2      (2,192,64,64)   ✓
+#   skip3      (2,384,32,32)   ✓
+
+# ── Format check (4D tensors, expected BCHW) ─────────────────
+#   bottleneck    [B=2, C=768, H=16, W=16]  ✓
+#   skip1         [B=2, C=96, H=128, W=128]  ✓
+#   skip2         [B=2, C=192, H=64, W=64]  ✓
+#   skip3         [B=2, C=384, H=32, W=32]  ✓
+
+# ── Gradient flow ─────────────────────────────────────────────
+#   Input grad norm : 0.004656  ✓
+
+# ── Channel progression ───────────────────────────────────────
+#   PatchEmbed   [B,1,512,512] → [B, 96,128,128]
+#   Scale1 VSS   [B,96,128,128]               (skip1)
+#   PatchMerge1  [B,96,128,128] → [B,192,64,64]
+#   Scale2 VSS   [B,192,64,64]                (skip2)
+#   PatchMerge2  [B,192,64,64]  → [B,384,32,32]
+#   Scale3 VSS   [B,384,32,32]                (skip3)
+#   PatchMerge3  [B,384,32,32]  → [B,768,16,16]
+#   Bottleneck   [B,768,16,16]                (F / BYOL input)
+
+# ── Drop-path schedule (8 blocks, linear 0→0.1) ───────────────
+#   block  0  drop_path = 0.0000
+#   block  1  drop_path = 0.0143
+#   block  2  drop_path = 0.0286
+#   block  3  drop_path = 0.0429
+#   block  4  drop_path = 0.0571
+#   block  5  drop_path = 0.0714
+#   block  6  drop_path = 0.0857
+#   block  7  drop_path = 0.1000
+
+# ============================================================
+# VMUNetEncoder: PASSED
+# ============================================================# ============================================================
+
+# ============================================================
+# models/vm_unet.py — self-test
+# ============================================================
+# Device : cuda
+
+# ── VMUNetEncoder ─────────────────────────────────────────────
+#   bottleneck : [2, 768, 16, 16]  ✓
+#   skip1      : [2, 96, 128, 128]  ✓
+#   skip2      : [2, 192, 64, 64]  ✓
+#   skip3      : [2, 384, 32, 32]  ✓
+# VMUNetEncoder: PASSED
+
+# ── VMUNetDecoder ─────────────────────────────────────────────
+#   features         : [2, 96, 512, 512]  ✓
+#   decoder_features : [2, 96, 512, 512]  ✓  (same tensor)
+#   Params : 8,687,616
+# VMUNetDecoder: PASSED
+
+# ── VMUNet (full model) ───────────────────────────────────────
+#   Encoder    params :    9,573,312
+#   Decoder    params :    8,687,616
+#   Seg head   params :          679
+#   Total      params :   18,261,607
+
+#   logits           : [2, 7, 512, 512]  ✓
+#   S                : [2, 7, 512, 512]  ✓
+#   F                : [2, 768, 16, 16]  ✓
+#   decoder_features : [2, 96, 512, 512]  ✓
+#   S sums to 1 (atol=1e-5)  ✓
+#   S in [0, 1]              ✓
+#   Gradient norm            : 0.725947  ✓
+#   freeze() → 0 trainable   ✓  (eval mode)
+#   Output keys              ✓  ['F', 'S', 'decoder_features', 'logits']
+
+# ============================================================
+# VMUNet: PASSED
+# ============================================================# ============================================================
+# ============================================================
+# utils/masking.py — self-test
+# ============================================================
+
+# ── Test 1: shape + correctness (all pixels → class 1) ────────
+#   Output shape : [2, 7, 96]  ✓
+#   e_a[:, 1, :] == global mean  ✓
+#   e_a[:, k≠1, :] ≈ 0          ✓
+
+# masked_average_pooling: PASSED
+
+# ── Test 2: soft weighting (50/50 split) ──────────────────────
+#   50/50 hard split → both class embeddings = 1.0  ✓
+
+# ── Test 3: empty class (absent organ) ────────────────────────
+#   Absent classes produce zero embeddings  ✓
+
+# ── Test 4: gradient flow ─────────────────────────────────────
+#   decoder_features grad norm : 0.000146  ✓
+
+# ── Test 5: compute_anatomy_embeddings wrapper ────────────────
+#   Output shape : [2, 7, 96]  ✓
+#   Wrapper == direct call      ✓
+#   Missing key raises KeyError ✓  ("vm_unet_output is missing required keys: {'decoder_features'}. Available keys: {'S'}")
+
+# ── Test 6: spatial mismatch raises ValueError ─────────────────
+#   Spatial mismatch raises ValueError  ✓
+
+# ── Test 7: real-like softmax S ───────────────────────────────
+#   Shape   : [2, 7, 96]  ✓
+#   Finite  : True  ✓
+#   e_a std : 0.0026  (reasonable range ✓)
+
+# ============================================================
+# All tests PASSED
+# ========================================================================================================================

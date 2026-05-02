@@ -250,3 +250,63 @@
 # ============================================================
 # All tests PASSED
 # ========================================================================================================================
+
+# ============================================================
+# models/stage1.py — self-test
+# ============================================================
+# Device : cuda
+
+# Self-test batch size B=1 (B=1 on CUDA to limit VRAM).
+
+# ── Instantiation ─────────────────────────────────────────────
+#   backbone               :   18,261,607
+#   byol_online_proj       :    4,202,752
+#   byol_target_proj       :    4,202,752
+#   byol_predictor         :    2,105,600
+#   total                  :   28,772,711
+
+#   Total Stage 1 parameters: 28.8M
+
+# ── Inference mode (return_byol=False) ────────────────────────
+#   S              : [1, 7, 512, 512]  ✓
+#   e_a            : [1, 7, 96]  ✓
+#   F              : [1, 768, 16, 16]  ✓
+#   logits         : [1, 7, 512, 512]  ✓
+#   decoder_feats  : [1, 96, 512, 512]  ✓
+#   byol_loss      : None  ✓
+#   S sums to 1    ✓
+#   S in [0,1]     ✓
+#   e_a finite     ✓
+# Stage1Model inference mode: PASSED
+
+# ── BYOL mode (return_byol=True, auto views) ──────────────────
+#   byol_loss      : 4.0000  (in [0, 8])  ✓
+# Stage1Model BYOL mode: PASSED (byol_loss=4.0000)
+
+# ── BYOL mode (explicit byol_view2) ───────────────────────────
+#   byol_loss (explicit view2) : 4.0000  ✓
+
+# ── get_anatomy_conditioning ──────────────────────────────────
+#   S   : [1, 7, 512, 512]  ✓
+#   e_a : [1, 7, 96]  ✓
+# Stage1Model.get_anatomy_conditioning: PASSED
+
+# ── Gradient flow ─────────────────────────────────────────────
+#   Seg loss grad norm : 0.713978  ✓
+#   Target projector: requires_grad=False  ✓
+
+# ── Output key completeness ───────────────────────────────────
+#   Keys: ['F', 'S', 'byol_loss', 'decoder_features', 'e_a', 'logits']  ✓
+
+# ── load_stage1_frozen error handling ─────────────────────────
+#   Missing checkpoint → FileNotFoundError  ✓
+
+# ── load_stage1_frozen round-trip ─────────────────────────────
+#   Round-trip identical outputs  ✓
+#   Trainable params after freeze : 0  ✓
+#   Eval mode after freeze        ✓
+
+# ============================================================
+# Total Stage 1 parameters: 28.8M
+# All tests PASSED
+# ========================================================================================================================

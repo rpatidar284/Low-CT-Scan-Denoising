@@ -1,5 +1,5 @@
 """
-losses/byol.py
+models/byol.py
 
 BYOL (Bootstrap Your Own Latent) — noise-invariant anatomy features.
 =====================================================================
@@ -32,8 +32,14 @@ Both directions are run by the caller and summed.
 
 Reference: Architecture.pdf — Chapter 9 (BYOL)
 
-Also re-exported from ``models/byol.py`` for the canonical import path
-``from models.byol import BYOLModule``.
+Normalization in projector / predictor
+----------------------------------------
+The original BYOL paper uses BatchNorm after the first linear in the MLP heads.
+``nn.BatchNorm1d`` requires **more than one sample per channel in training
+mode**, so **batch size 1** raises ``ValueError`` (common in medical imaging
+or gradient accumulation). We use ``nn.LayerNorm(hidden_dim)`` on vectors
+``[B, hidden_dim]`` instead: same *per-sample* affine stabilisation, works for
+any ``B ≥ 1`` in both train and eval. Import path: ``from models.byol import BYOLModule``.
 """
 
 import torch
@@ -52,7 +58,7 @@ class ProjectorMLP(nn.Module):
 
     Input:  F [B, in_dim, 16, 16]  (spatial feature map)
     Step 1: Global average pool → [B, in_dim]
-    Step 2: Linear(in_dim → hidden_dim) → BatchNorm1d → ReLU
+    Step 2: Linear(in_dim → hidden_dim) → LayerNorm(hidden_dim) → ReLU
     Step 3: Linear(hidden_dim → out_dim)
     Output: z [B, out_dim]
 
@@ -67,11 +73,11 @@ class ProjectorMLP(nn.Module):
 
     Notes
     -----
-    * BatchNorm1d is applied after the first linear layer, consistent with
-      the original BYOL paper and Architecture.pdf Chapter 9.
+    * LayerNorm (not BatchNorm1d) after the first linear avoids the B=1 train
+      crash; see module docstring.
     * Global average pooling collapses (H, W) → scalar per channel,
       giving a single vector per image regardless of spatial size.
-    * The last linear layer has NO BatchNorm or activation — the
+    * The last linear layer has no extra norm or activation — the
       raw projection is normalised in the loss computation.
     """
 
@@ -86,7 +92,7 @@ class ProjectorMLP(nn.Module):
         self.net = nn.Sequential(
             # ── Layer 1 ──────────────────────────────────────────────────
             nn.Linear(in_dim, hidden_dim, bias=False),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             # ── Layer 2 ──────────────────────────────────────────────────
             nn.Linear(hidden_dim, out_dim, bias=True),
@@ -128,7 +134,7 @@ class PredictorMLP(nn.Module):
     Predicts the target network's projection from the online projection.
 
     Input:  z [B, in_dim]
-    Step 1: Linear(in_dim → hidden_dim) → BatchNorm1d → ReLU
+    Step 1: Linear(in_dim → hidden_dim) → LayerNorm(hidden_dim) → ReLU
     Step 2: Linear(hidden_dim → out_dim)
     Output: q [B, out_dim]
 
@@ -158,7 +164,7 @@ class PredictorMLP(nn.Module):
         self.net = nn.Sequential(
             # ── Layer 1 ──────────────────────────────────────────────────
             nn.Linear(in_dim, hidden_dim, bias=False),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             # ── Layer 2 ──────────────────────────────────────────────────
             nn.Linear(hidden_dim, out_dim, bias=True),
@@ -431,7 +437,7 @@ def get_ema_tau(
 
 if __name__ == '__main__':
     print("=" * 60)
-    print("losses/byol.py — self-test")
+    print("models/byol.py — self-test")
     print("=" * 60)
 
     # ── ProjectorMLP ──────────────────────────────────────────────────────
@@ -597,8 +603,7 @@ if __name__ == '__main__':
     print("\n── Loss range / edge cases ───────────────────────────────────")
 
     byol_edge = BYOLModule(feature_dim=768)
-    # BatchNorm1d in projector/predictor rejects B=1 in training mode.
-    byol_edge.eval()
+    # LayerNorm allows B=1 in training mode (no need for .eval() workaround).
 
     # Identical F_online and F_target should give low loss (near 0 after training)
     # At init with zero predictor, q ≈ 0 → loss ≈ 2

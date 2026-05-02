@@ -574,6 +574,7 @@ if __name__ == '__main__':
         assert not loaded.training
 
         x_tiny = torch.randn(1, 1, 512, 512)
+        tiny.eval()
         with torch.no_grad():
             o1 = tiny(x_tiny,   return_byol=False)
             o2 = loaded(x_tiny, return_byol=False)

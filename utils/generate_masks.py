@@ -440,7 +440,7 @@ def main():
         p.name
         for p in data_root.iterdir()
         if p.is_dir()
-        and p.name.startswith('C')          # patient IDs start with 'C'
+        and (p.name.startswith('C') or p.name.startswith('L'))  # patient IDs
         and (p / 'HDCT').exists()
     ])
 

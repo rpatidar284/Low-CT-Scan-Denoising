@@ -571,3 +571,15 @@ if __name__ == '__main__':
         except Exception as exc:
             print(f"\n✗ Unexpected error:\n  {exc}", file=sys.stderr)
             raise
+# Single slice, interactive
+# python3 utils/visualise_masks.py --patient C002 --slice 100
+
+# # Single slice, save to file (headless server)
+# python3 utils/visualise_masks.py --patient C002 --slice 100 --save mask_check.png
+
+# # Multiple slices, save each to a directory
+# python3 utils/visualise_masks.py --patient C002 \
+#     --slices 0 50 100 150 200 \
+#     --save_dir ./mask_checks/C002/
+
+# # Different patient and custom paths

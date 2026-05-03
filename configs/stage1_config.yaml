@@ -110,12 +110,12 @@ training:
   # which is mathematically correct and outperforms vanilla Adam for
   # Transformer / Mamba-based networks.
   optimizer:     adamw
-  learning_rate: 1.0e-4    # peak LR after linear warmup
+  learning_rate: 3.0e-5    # peak LR after linear warmup (lowered from 1.0e-4 for stability)
   weight_decay:  0.01      # L2 regularisation coefficient
 
   # ── Schedule ──────────────────────────────────────────────────────────────
   total_steps:  30000      # total gradient update steps (smaller runs train faster)
-  warmup_steps: 500        # linear LR warmup from 0 → learning_rate
+  warmup_steps: 2000       # linear LR warmup from 0 → learning_rate (increased from 500 for stability)
 
   # After warmup, use cosine annealing: LR decays from learning_rate → 0
   # over the remaining (total_steps - warmup_steps) steps.

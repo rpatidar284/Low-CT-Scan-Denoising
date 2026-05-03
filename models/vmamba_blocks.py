@@ -341,6 +341,7 @@ class VSSD(nn.Module):
         D_vec = self.D.to(dtype=xc.dtype)
 
         delta = F.softplus(self.delta_proj(xc))
+        delta = delta.clamp(max=10.0)  # Prevent delta from becoming too large
         Bs = self.B_proj(xc)
         Cs = self.C_proj(xc)
 
@@ -355,6 +356,12 @@ class VSSD(nn.Module):
 
         log_dA = torch.log(dA.clamp(min=1e-38))
         A_cumsum = torch.cumsum(log_dA, dim=1)
+        
+        # Clamp A_cumsum to prevent exp() overflow in long sequences
+        # max=0.0 because log(dA) should always be ≤ 0 (dA ≤ 1, decay)
+        # min=-20.0 prevents underflow (exp(-20) ≈ 2e-9, effectively zero)
+        A_cumsum = A_cumsum.clamp(min=-20.0, max=0.0)
+        
         dB_u_scaled = dB_u * torch.exp(-A_cumsum)
         inner = torch.cumsum(dB_u_scaled, dim=1)
         h = torch.exp(A_cumsum) * (h_carry.unsqueeze(1) + inner)

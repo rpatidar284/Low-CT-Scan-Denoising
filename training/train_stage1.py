@@ -30,6 +30,7 @@ Checkpoints
 Reference: Architecture.pdf – Chapters 8 and 9
 """
 
+import logging
 import math
 import os
 import sys
@@ -46,6 +47,83 @@ try:
     from tqdm.auto import tqdm as _tqdm
 except ImportError:
     _tqdm = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging Setup
+# ─────────────────────────────────────────────────────────────────────────────
+
+def setup_logger(log_path: str) -> logging.Logger:
+    """
+    Returns a logger that writes to both console (stdout) and log file.
+    Format: [2024-01-15 14:32:01] STEP 1000 | ...
+    """
+    logger = logging.getLogger('stage1')
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()  # avoid duplicate handlers on re-run
+
+    fmt = logging.Formatter(
+        fmt='[%(asctime)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    # File handler — appends so resume adds to same log
+    fh = logging.FileHandler(log_path, mode='a')
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    return logger
+
+
+def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
+    """
+    Scans checkpoint_dir for stage1_step_*.pth files.
+    Returns path of the one with the highest step number, or None.
+    Does NOT return stage1_best.pth (that has no step number).
+    """
+    ckpt_dir = Path(checkpoint_dir)
+    pattern = 'stage1_step_*.pth'
+    files = list(ckpt_dir.glob(pattern))
+    if not files:
+        return None
+    # Extract step number from filename and return highest
+    def _step(f):
+        try:
+            return int(f.stem.split('_')[-1])
+        except (ValueError, IndexError):
+            return -1
+    valid_files = [f for f in files if _step(f) > 0]
+    if not valid_files:
+        return None
+    return str(max(valid_files, key=_step))
+
+
+def cleanup_old_checkpoints(checkpoint_dir: str, keep: int = 3, logger: Optional[logging.Logger] = None) -> None:
+    """Delete step checkpoints older than the last `keep` ones."""
+    files = sorted(
+        Path(checkpoint_dir).glob('stage1_step_*.pth'),
+        key=lambda f: int(f.stem.split('_')[-1]) if f.stem.split('_')[-1].isdigit() else -1
+    )
+    for f in files[:-keep]:
+        try:
+            f.unlink()
+            if logger:
+                logger.info(f"Deleted old checkpoint: {f.name}")
+        except Exception as e:
+            if logger:
+                logger.warning(f"Failed to delete {f.name}: {e}")
+
+
+def infinite_loader(dataloader):
+    """Yields batches forever, reshuffling each epoch."""
+    while True:
+        for batch in dataloader:
+            yield batch
 
 
 def _log_train_line(msg: str) -> None:
@@ -262,8 +340,11 @@ def _save_checkpoint(
     epoch:       int,
     model:       nn.Module,
     optimizer:   torch.optim.Optimizer,
+    scheduler:   Optional[torch.optim.lr_scheduler.LambdaLR],
     best_dice:   float,
     config:      dict,
+    logger:      Optional[logging.Logger] = None,
+    byol_ema_tau: float = 1.0,
 ) -> None:
     """Save training state to *path*."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -273,31 +354,44 @@ def _save_checkpoint(
             'epoch':               epoch,
             'model_state_dict':    model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
             'best_val_dice':       best_dice,
             'config':              config,
+            'byol_ema_tau':        byol_ema_tau,
         },
         path,
     )
-    _log_train_line(f"  [ckpt] Saved → {path}")
+    if logger:
+        logger.info(f"Checkpoint saved → {Path(path).name} (dice={best_dice:.4f})")
+    else:
+        _log_train_line(f"  [ckpt] Saved → {path}")
 
 
 def _load_checkpoint(
     path:      str,
     model:     nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler.LambdaLR],
     device:    torch.device,
+    logger:    Optional[logging.Logger] = None,
 ):
     """
-    Load a checkpoint in-place.  Returns (step, epoch, best_val_dice).
+    Load a checkpoint in-place.  Returns (step, epoch, best_val_dice, byol_ema_tau).
     """
     ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt['model_state_dict'])
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-    step      = ckpt.get('step',          0)
-    epoch     = ckpt.get('epoch',         0)
-    best_dice = ckpt.get('best_val_dice', 0.0)
-    print(f"  [ckpt] Resumed from {path}  (step={step}, epoch={epoch})")
-    return step, epoch, best_dice
+    if scheduler is not None and ckpt.get('scheduler_state_dict') is not None:
+        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+    step       = ckpt.get('step',          0)
+    epoch      = ckpt.get('epoch',         0)
+    best_dice  = ckpt.get('best_val_dice', 0.0)
+    byol_tau   = ckpt.get('byol_ema_tau',  1.0)
+    if logger:
+        logger.info(f"Resuming from step {step} | best_val_dice={best_dice:.4f}")
+    else:
+        print(f"  [ckpt] Resumed from {path}  (step={step}, epoch={epoch})")
+    return step, epoch, best_dice, byol_tau
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -313,6 +407,7 @@ def _validate(
     step:         int,
     epoch:        int,
     log_fn:       Callable[[str], None] = _log_train_line,
+    logger:       Optional[logging.Logger] = None,
 ) -> float:
     """
     Run segmentation inference on up to *max_batches* validation batches.
@@ -344,13 +439,24 @@ def _validate(
 
     dice_scores = compute_dice_per_class(probs, targets)
 
-    log_fn(
-        f"  [val]  step={step:6d}  epoch={epoch:3d}  "
-        f"mean_dice={dice_scores['mean']:.4f}  "
-        f"liver={dice_scores['liver_spleen']:.4f}  "
-        f"kidney={dice_scores['kidney']:.4f}  "
-        f"lung={dice_scores['lung']:.4f}"
+    msg = (
+        f"Step {step:6d} | Val Dice → "
+        f"liver={dice_scores['liver_spleen']:.4f} "
+        f"kidney={dice_scores['kidney']:.4f} "
+        f"lung={dice_scores['lung']:.4f} "
+        f"mean={dice_scores['mean']:.4f}"
     )
+    
+    if logger:
+        logger.info(msg)
+    else:
+        log_fn(
+            f"  [val]  step={step:6d}  epoch={epoch:3d}  "
+            f"mean_dice={dice_scores['mean']:.4f}  "
+            f"liver={dice_scores['liver_spleen']:.4f}  "
+            f"kidney={dice_scores['kidney']:.4f}  "
+            f"lung={dice_scores['lung']:.4f}"
+        )
 
     model.train()
     return dice_scores['mean']
@@ -406,7 +512,7 @@ def train_stage1(
     ema_tau_end       = cfg['ema_tau_end']
     log_every         = cfg['log_every']
     val_every         = cfg['val_every']
-    save_every        = cfg['save_every']
+    save_every        = 1000  # Changed from cfg['save_every']; now hardcoded to 1000
     val_batches       = cfg['val_batches']
     label_smoothing   = cfg['label_smoothing']
     embed_dim         = cfg['embed_dim']
@@ -423,7 +529,17 @@ def train_stage1(
 
     # ── Device ────────────────────────────────────────────────────────────
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"[train_stage1] device={device}  total_steps={total_steps}")
+
+    # ── Logging setup ─────────────────────────────────────────────────────
+    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    log_path = Path(checkpoint_dir) / 'training.log'
+    logger = setup_logger(str(log_path))
+
+    # Log training start
+    logger.info(
+        f"Training start | device={device} | total_steps={total_steps} | "
+        f"batch_size={batch_size} | lr={peak_lr:.2e} | warmup_steps={warmup_steps}"
+    )
 
     # ── Data ──────────────────────────────────────────────────────────────
     if use_dummy_data:
@@ -437,7 +553,7 @@ def train_stage1(
         val_loader = DataLoader(
             val_ds, batch_size=batch_size, shuffle=False, num_workers=0,
         )
-        print(f"[data] Using DummyCTDataset  image_size={image_size}")
+        logger.info(f"Using DummyCTDataset | image_size={image_size} | train_batches={len(train_loader)} | val_batches={len(val_loader)}")
     else:
         loaders      = create_dataloaders(
             data_root   = data_root,
@@ -448,12 +564,10 @@ def train_stage1(
         )
         train_loader = loaders['train']
         val_loader   = loaders['val']
+        logger.info(f"Loaded real data | train_patients={len(train_loader.dataset)} | val_patients={len(val_loader.dataset)}")
 
     batches_per_epoch = len(train_loader)
-    print(
-        f"[train_stage1] image_size={image_size}  batches_per_epoch="
-        f"{batches_per_epoch}  log_every={log_every}  val_every={val_every}"
-    )
+    logger.info(f"Data ready | image_size={image_size} | batches_per_epoch={batches_per_epoch} | log_every={log_every} | val_every={val_every}")
 
     # ── Model ─────────────────────────────────────────────────────────────
     model = Stage1Model(
@@ -466,7 +580,7 @@ def train_stage1(
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[model] Stage1Model  params={n_params/1e6:.1f}M")
+    logger.info(f"Stage1Model initialized | params={n_params/1e6:.1f}M")
 
     # ── Loss ──────────────────────────────────────────────────────────────
     seg_criterion = SegmentationLoss(
@@ -485,20 +599,50 @@ def train_stage1(
         weight_decay = weight_decay,
     )
 
+    # LR scheduler (lambda function)
+    def lr_lambda(current_step: int) -> float:
+        if current_step < warmup_steps:
+            return (current_step + 1) / warmup_steps
+        progress = (current_step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    logger.info(f"Optimizer initialized | lr={peak_lr:.2e} | weight_decay={weight_decay}")
+
     # ── Optional resume ───────────────────────────────────────────────────
-    step       = 0
-    epoch      = 0
-    best_dice  = 0.0
+    step           = 0
+    epoch          = 0
+    best_dice      = 0.0
+    current_tau    = ema_tau_start
+
+    # Auto-detect resume if no explicit resume_from given
+    if resume_from is None:
+        resume_from = find_latest_checkpoint(checkpoint_dir)
+        if resume_from:
+            logger.info(f"Auto-detected checkpoint: {resume_from}")
 
     if resume_from and Path(resume_from).exists():
-        step, epoch, best_dice = _load_checkpoint(
-            resume_from, model, optimizer, device
+        step, epoch, best_dice, current_tau = _load_checkpoint(
+            resume_from, model, optimizer, scheduler, device, logger=logger
         )
-
-    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        # Update step to next step after resume
+        step += 1
+    else:
+        logger.info(f"Starting fresh training from step 0")
 
     # ── Training loop ─────────────────────────────────────────────────────
     model.train()
+
+    # Infinite loader pattern for proper resume
+    loader_iter = infinite_loader(train_loader)
+
+    # Skip batches already processed (fast-forward after resume)
+    start_step = step
+    if start_step > 0:
+        logger.info(f"Fast-forwarding dataloader by {start_step % len(train_loader)} batches...")
+        for _ in range(start_step % len(train_loader)):
+            next(loader_iter)
+        logger.info("Dataloader ready.")
 
     # Running stats for periodic logging
     running_seg_loss  = 0.0
@@ -506,167 +650,175 @@ def train_stage1(
     running_steps     = 0
     t0                = time.time()
 
-    print(f"\n{'─'*60}")
-    print(f" Stage 1 training starts  |  BYOL active from epoch {byol_start_epoch}")
-    print(f"{'─'*60}\n")
-    if _tqdm is None:
-        print("[train_stage1] Install tqdm (`pip install tqdm`) for a live progress bar.")
+    logger.info(f"Training start | BYOL active from epoch {byol_start_epoch}")
 
     stop_training = False
     prog = _StepProgressBar(total_steps, initial=step)
 
     try:
         while not stop_training:
-            for batch in train_loader:
+            # Step is incremented at the END of each iteration, so we use it
+            # to check termination and checkpoint save conditions
 
-                # ── LR schedule ───────────────────────────────────────────
-                lr = _get_lr(step, total_steps, warmup_steps, peak_lr)
-                _set_lr(optimizer, lr)
+            # ── LR schedule ───────────────────────────────────────────
+            lr = _get_lr(step, total_steps, warmup_steps, peak_lr)
+            _set_lr(optimizer, lr)
 
-                # ── Decide whether BYOL is active ─────────────────────────
-                byol_active = (epoch >= byol_start_epoch)
+            # ── Decide whether BYOL is active ─────────────────────────
+            byol_active = (epoch >= byol_start_epoch)
 
-                # ── Move data to device ───────────────────────────────────
-                # Stage 1 trains on the NDCT (clean / HDCT) images.
-                ndct = batch['ndct'].to(device, non_blocking=True)  # [B, 1, H, W]
-                mask = batch['mask'].to(device, non_blocking=True)   # [B, H, W]
+            # ── Get next batch ─────────────────────────────────────────
+            batch = next(loader_iter)
 
-                # ── Forward pass ──────────────────────────────────────────
-                optimizer.zero_grad(set_to_none=True)
+            # ── Move data to device ───────────────────────────────────
+            # Stage 1 trains on the NDCT (clean / HDCT) images.
+            ndct = batch['ndct'].to(device, non_blocking=True)  # [B, 1, H, W]
+            mask = batch['mask'].to(device, non_blocking=True)   # [B, H, W]
 
-                out = model(ndct, return_byol=byol_active)
+            # ── Forward pass ──────────────────────────────────────────
+            optimizer.zero_grad(set_to_none=True)
 
-                # ── Segmentation loss ─────────────────────────────────────
-                l_seg = seg_criterion(out['logits'], mask)
-                loss  = seg_weight * l_seg
+            out = model(ndct, return_byol=byol_active)
 
-                # ── BYOL loss (phase 2 only) ──────────────────────────────
-                l_byol_val = 0.0
-                if byol_active and out['byol_loss'] is not None:
-                    l_byol     = out['byol_loss']
-                    loss       = loss + byol_weight * l_byol
-                    l_byol_val = l_byol.item()
+            # ── Segmentation loss ─────────────────────────────────────
+            l_seg = seg_criterion(out['logits'], mask)
+            loss  = seg_weight * l_seg
 
-                # ── Backward ──────────────────────────────────────────────
-                loss.backward()
+            # ── BYOL loss (phase 2 only) ──────────────────────────────
+            l_byol_val = 0.0
+            if byol_active and out['byol_loss'] is not None:
+                l_byol     = out['byol_loss']
+                loss       = loss + byol_weight * l_byol
+                l_byol_val = l_byol.item()
 
-                # Gradient clipping prevents exploding gradients in Mamba layers
-                torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+            # ── Backward ──────────────────────────────────────────────
+            loss.backward()
 
-                optimizer.step()
+            # Gradient clipping prevents exploding gradients in Mamba layers
+            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
 
-                # ── EMA update of BYOL target projector ───────────────────
-                tau = get_ema_tau(step, total_steps, ema_tau_start, ema_tau_end)
-                model.byol.update_target_projector(tau)
+            optimizer.step()
+            scheduler.step()
 
-                # ── Accumulate stats ──────────────────────────────────────
-                running_seg_loss  += l_seg.item()
-                running_byol_loss += l_byol_val
-                running_steps     += 1
+            # ── EMA update of BYOL target projector ───────────────────
+            tau = get_ema_tau(step, total_steps, ema_tau_start, ema_tau_end)
+            current_tau = tau
+            model.byol.update_target_projector(tau)
 
-                step += 1   # step is 1-indexed after this point
+            # ── Accumulate stats ──────────────────────────────────────
+            running_seg_loss  += l_seg.item()
+            running_byol_loss += l_byol_val
+            running_steps     += 1
 
-                prog.step(
-                    l_seg=l_seg.item(),
-                    l_byol=float(l_byol_val),
-                    lr=lr,
-                    epoch=epoch,
-                    byol_active=byol_active,
+            step += 1   # step is 1-indexed after this point
+
+            prog.step(
+                l_seg=l_seg.item(),
+                l_byol=float(l_byol_val),
+                lr=lr,
+                epoch=epoch,
+                byol_active=byol_active,
+            )
+
+            # ── Periodic logging ──────────────────────────────────────
+            if step % log_every == 0:
+                avg_seg  = running_seg_loss  / running_steps
+                avg_byol = running_byol_loss / running_steps
+                elapsed  = time.time() - t0
+                sec_per_step = elapsed / max(running_steps, 1)
+
+                byol_str = (
+                    f" | L_byol={avg_byol:.4f}"
+                    if byol_active else ""
+                )
+                logger.info(
+                    f"Step {step:6d} | ep={epoch:3d} | L_seg={avg_seg:.4f}{byol_str} | "
+                    f"lr={lr:.2e} | {sec_per_step:.2f}s/step"
                 )
 
-                # ── Periodic logging ──────────────────────────────────────
-                if step % log_every == 0:
-                    avg_seg  = running_seg_loss  / running_steps
-                    avg_byol = running_byol_loss / running_steps
-                    elapsed  = time.time() - t0
-                    steps_per_sec = running_steps / max(elapsed, 1e-6)
+                # Reset running stats
+                running_seg_loss  = 0.0
+                running_byol_loss = 0.0
+                running_steps     = 0
+                t0                = time.time()
 
-                    byol_str = (
-                        f"  L_byol={avg_byol:.4f}"
-                        if byol_active else "  L_byol=--"
-                    )
-                    pct = 100.0 * step / max(total_steps, 1)
-                    _log_train_line(
-                        f"  step={step:6d}/{total_steps} ({pct:5.2f}%)  "
-                        f"epoch={epoch:3d}  "
-                        f"L_seg={avg_seg:.4f}{byol_str}  "
-                        f"lr={lr:.2e}  "
-                        f"{steps_per_sec:.2f} steps/s"
-                    )
+            # ── Validation ────────────────────────────────────────────
+            if step % val_every == 0:
+                mean_dice = _validate(
+                    model, val_loader, device, val_batches, step, epoch,
+                    logger=logger
+                )
 
-                    # Reset running stats
-                    running_seg_loss  = 0.0
-                    running_byol_loss = 0.0
-                    running_steps     = 0
-                    t0                = time.time()
-
-                # ── Validation ────────────────────────────────────────────
-                if step % val_every == 0:
-                    mean_dice = _validate(
-                        model, val_loader, device, val_batches, step, epoch,
-                        log_fn=_log_train_line,
-                    )
-
-                    if mean_dice > best_dice:
-                        best_dice = mean_dice
-                        _save_checkpoint(
-                            path      = os.path.join(
-                                checkpoint_dir, 'stage1_best.pth'
-                            ),
-                            step      = step,
-                            epoch     = epoch,
-                            model     = model,
-                            optimizer = optimizer,
-                            best_dice = best_dice,
-                            config    = cfg,
-                        )
-                        _log_train_line(
-                            f"  [val]  ★ New best val Dice = {best_dice:.4f}"
-                        )
-
-                    model.train()
-
-                # ── Periodic checkpoint ───────────────────────────────────
-                if step % save_every == 0:
+                if mean_dice > best_dice:
+                    best_dice = mean_dice
                     _save_checkpoint(
                         path      = os.path.join(
-                            checkpoint_dir, f'stage1_step_{step}.pth'
+                            checkpoint_dir, 'stage1_best.pth'
                         ),
                         step      = step,
                         epoch     = epoch,
                         model     = model,
                         optimizer = optimizer,
+                        scheduler = scheduler,
                         best_dice = best_dice,
                         config    = cfg,
+                        logger    = logger,
+                        byol_ema_tau = current_tau,
                     )
+                    logger.info(f"Step {step:6d} | ★ New best val Dice = {best_dice:.4f}")
 
-                # ── Termination guard ─────────────────────────────────────
-                if step >= total_steps:
-                    stop_training = True
-                    break
+                model.train()
 
-            # End of one epoch over the training loader
-            epoch += 1
+            # ── Periodic checkpoint (every 1000 steps) ────────────────
+            if step % save_every == 0 and step > 0:
+                _save_checkpoint(
+                    path      = os.path.join(
+                        checkpoint_dir, f'stage1_step_{step}.pth'
+                    ),
+                    step      = step,
+                    epoch     = epoch,
+                    model     = model,
+                    optimizer = optimizer,
+                    scheduler = scheduler,
+                    best_dice = best_dice,
+                    config    = cfg,
+                    logger    = logger,
+                    byol_ema_tau = current_tau,
+                )
+                # Cleanup old checkpoints; keep only last 3
+                cleanup_old_checkpoints(checkpoint_dir, keep=3, logger=logger)
 
-            if stop_training:
+            # ── Check epoch boundary ──────────────────────────────────
+            if step % batches_per_epoch == 0:
+                epoch += 1
+
+            # ── Termination guard ─────────────────────────────────────
+            if step >= total_steps:
+                stop_training = True
                 break
 
     finally:
         prog.close()
 
     # ── Final checkpoint ──────────────────────────────────────────────────
-    _save_checkpoint(
-        path      = os.path.join(checkpoint_dir, f'stage1_step_{step}_final.pth'),
-        step      = step,
-        epoch     = epoch,
-        model     = model,
-        optimizer = optimizer,
-        best_dice = best_dice,
-        config    = cfg,
-    )
+    if step > 0:  # Only save if we actually trained
+        _save_checkpoint(
+            path      = os.path.join(checkpoint_dir, f'stage1_step_{step}_final.pth'),
+            step      = step,
+            epoch     = epoch,
+            model     = model,
+            optimizer = optimizer,
+            scheduler = scheduler,
+            best_dice = best_dice,
+            config    = cfg,
+            logger    = logger,
+            byol_ema_tau = current_tau,
+        )
 
-    print(f"\n[train_stage1] Training complete.  "
-          f"steps={step}  epochs={epoch}  best_val_dice={best_dice:.4f}")
+    logger.info(
+        f"Training complete | total_steps={step} | total_epochs={epoch} | "
+        f"best_val_dice={best_dice:.4f}"
+    )
     return model
 
 

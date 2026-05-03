@@ -61,9 +61,12 @@ model:
   # Decoder uses mirrored counts (same depths list reversed).
   depths: [2, 2, 2, 2]
 
+  # ── VMamba selective-scan state dim (VRAM ∝ d_state) ──────────────────────
+  d_state: 8
+
   # ── Patch Embedding ───────────────────────────────────────────────────────
   # Conv2d(in_channels=1, out_channels=96, kernel_size=4, stride=4)
-  # 512 / 4 = 128  →  input to encoder is [B, 96, 128, 128]
+  # e.g. 256 / 4 = 64 → encoder scale-1 grid [B, 96, 64, 64]
   patch_size: 4
 
   # ── Bottleneck output dimension  (base_channels * 2^3 = 96 * 8 = 768) ────
@@ -99,8 +102,8 @@ model:
 # ═════════════════════════════════════════════════════════════════════════════
 training:
   # ── Batch / resolution ───────────────────────────────────────────────────
-  batch_size:  8            # images per GPU per step
-  image_size:  512          # H = W = 512 pixels (standard CT slice size)
+  batch_size:  4     # smaller spatial size allows larger batches
+  image_size:  256    # resize CT + masks (512² on disk → train at 256²)
 
   # ── Optimiser ─────────────────────────────────────────────────────────────
   # AdamW: applies weight decay directly to weights (not via gradient),
@@ -111,8 +114,8 @@ training:
   weight_decay:  0.01      # L2 regularisation coefficient
 
   # ── Schedule ──────────────────────────────────────────────────────────────
-  total_steps:  100000     # total gradient update steps
-  warmup_steps: 1000       # linear LR warmup from 0 → learning_rate
+  total_steps:  30000      # total gradient update steps (smaller runs train faster)
+  warmup_steps: 500        # linear LR warmup from 0 → learning_rate
 
   # After warmup, use cosine annealing: LR decays from learning_rate → 0
   # over the remaining (total_steps - warmup_steps) steps.
@@ -138,8 +141,8 @@ training:
   #             Delayed by byol_start_epoch to let L_seg stabilise first.
   #
   loss_seg_weight:  1.0
-  loss_byol_weight: 0.1
-  byol_start_epoch: 5      # L_byol weight ramps from 0.0 → 0.1 at this epoch
+  loss_byol_weight: 0.1    # λ_byol — scaled BYOL term (also called λ in docs)
+  byol_start_epoch: 3      # BYOL loss active once epoch ≥ this
 
   # ── Label smoothing  (ε = 0.1) ────────────────────────────────────────────
   # TotalSegmentator makes errors 5-15% of the time, especially at boundaries.
@@ -237,9 +240,9 @@ data:
 # ═════════════════════════════════════════════════════════════════════════════
 logging:
   # ── Frequency ─────────────────────────────────────────────────────────────
-  log_every_n_steps:  100   # write scalar metrics (loss, LR, …) to TensorBoard
-  eval_every_n_steps: 1000  # run validation loop and compute Dice scores
-  save_every_n_steps: 5000  # save a full checkpoint (model + optimiser state)
+  log_every_n_steps:  100   # console / TensorBoard cadence (train_stage1 uses this)
+  eval_every_n_steps: 500   # validation Dice (fits ~60× over 30k steps)
+  save_every_n_steps: 3000  # periodic checkpoints + stage1_best when Dice improves
 
   # ── Metrics tracked ───────────────────────────────────────────────────────
   # Training:   loss_total, loss_seg, loss_byol, learning_rate, grad_norm
@@ -305,13 +308,13 @@ assertions:
   channels_scale3: 384       # base_channels * 4
   channels_scale4: 768       # base_channels * 8  (bottleneck)
 
-  # Feature map sizes after patch embedding (image_size / patch_size)
-  feat_size_scale1: 128      # 512 / 4
-  feat_size_scale2: 64       # 512 / 8
-  feat_size_scale3: 32       # 512 / 16
-  feat_size_scale4: 16       # 512 / 32  (bottleneck)
+  # Feature map sizes after patch embedding (image_size / patch_size); example image_size=256
+  feat_size_scale1: 64       # 256 / 4
+  feat_size_scale2: 32       # 256 / 8
+  feat_size_scale3: 16       # 256 / 16
+  feat_size_scale4: 8        # 256 / 32  (bottleneck spatial grid)
 
-  # Output shapes
-  S_shape:   [B, 7, 512, 512]    # soft segmentation map
+  # Output shapes (match training.image_size)
+  S_shape:   [B, 7, 256, 256]   # soft segmentation map at train resolution
   e_a_shape: [B, 7, 96]          # anatomy embeddings
-  F_shape:   [B, 768, 16, 16]    # bottleneck features (for BYOL only)
+  F_shape:   [B, 768, 8, 8]      # bottleneck features when image_size=256 (BYOL)

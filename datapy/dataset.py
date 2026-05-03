@@ -1,5 +1,3 @@
-
-```python
 """
 data/dataset.py
 
@@ -15,10 +13,10 @@ Provides paired HDCT/LDCT slice loading with:
 Directory layout expected on disk
 ----------------------------------
   data/
-    C002/
+    C002/     ← patient IDs: ``C<number>`` or ``L<number>`` (case-insensitive)
       HDCT/   ← high-dose slices  (mapped to 'ndct' in code)
       LDCT/   ← low-dose slices   (mapped to 'ldct' in code)
-    C004/
+    L014/
       HDCT/
       LDCT/
     ...
@@ -42,6 +40,7 @@ from typing  import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 
@@ -193,7 +192,7 @@ class CTSliceDataset(Dataset):
     'ndct'       : [1, H, W] float32  normalised to [0, 1]
     'ldct'       : [1, H, W] float32  normalised to [0, 1]
     'mask'       : [H, W]    int64    organ labels 0-6  (zeros if absent)
-    'patient_id' : str                e.g. 'C002'
+    'patient_id' : str                e.g. 'C002', 'L014'
     'slice_idx'  : int                0-based slice index within patient
     'hdct_path'  : str                full path to HDCT file
     'ldct_path'  : str                full path to LDCT file
@@ -247,8 +246,9 @@ class CTSliceDataset(Dataset):
         masks_root:  str   = MASKS_ROOT,
         split:       str   = 'train',
         split_ratio: Tuple = (0.8, 0.1, 0.1),
-        seed:        int   = 42,
-        augment:     bool  = True,
+        seed:         int   = 42,
+        augment:      bool  = True,
+        target_size: Optional[int] = None,
     ):
         super().__init__()
 
@@ -260,22 +260,25 @@ class CTSliceDataset(Dataset):
         self.data_root  = Path(data_root)
         self.masks_root = Path(masks_root) if masks_root else None
         self.split      = split
-        self.augment    = augment and (split == 'train')
-        self.seed       = seed
+        self.augment     = augment and (split == 'train')
+        self.seed        = seed
+        self.target_size = target_size   # if set, resize CT + mask to H=W
 
         # ── Discover patient folders ──────────────────────────────────────
+        # Accept C### / L### (case-insensitive), both cohort prefixes used on disk.
+        _patient_dir_re = re.compile(r'^[CLcl]\d+$')
         all_patients: List[str] = sorted([
             p.name
             for p in self.data_root.iterdir()
             if p.is_dir()
-            and re.match(r'^C\d+', p.name)          # C002, C004, …
+            and _patient_dir_re.match(p.name)
             and (p / 'HDCT').exists()
             and (p / 'LDCT').exists()
         ])
 
         if len(all_patients) == 0:
             raise FileNotFoundError(
-                f"No valid patient folders (C###/HDCT + C###/LDCT) found "
+                f"No valid patient folders ([C|L]### with HDCT + LDCT) found "
                 f"under {data_root}."
             )
 
@@ -407,6 +410,27 @@ class CTSliceDataset(Dataset):
         # ── Load (or synthesise) mask ─────────────────────────────────────
         mask = self._load_mask(patient_id, slice_idx, h, w)   # [H, W]
 
+        # ── Resize (masks may be 512² while training at smaller resolution) ──
+        if self.target_size is not None:
+            ts = self.target_size
+            ndct = F.interpolate(
+                ndct.unsqueeze(0),
+                size=(ts, ts),
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(0)
+            ldct = F.interpolate(
+                ldct.unsqueeze(0),
+                size=(ts, ts),
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(0)
+            mask = F.interpolate(
+                mask.unsqueeze(0).unsqueeze(0).float(),
+                size=(ts, ts),
+                mode='nearest',
+            ).squeeze(0).squeeze(0).long()
+
         # ── Augmentation (training only) ──────────────────────────────────
         # Use a per-sample RNG so ndct / ldct / mask receive identical flips.
         if self.augment:
@@ -442,6 +466,7 @@ def create_dataloaders(
     masks_root:  str = CTSliceDataset.MASKS_ROOT,
     batch_size:  int = 8,
     num_workers: int = 4,
+    image_size: Optional[int] = None,
 ) -> Dict[str, DataLoader]:
     """
     Create train / val / test DataLoaders for the CT data.
@@ -452,6 +477,7 @@ def create_dataloaders(
     masks_root  : str  Directory with TotalSegmentator masks.
     batch_size  : int  Mini-batch size.  Default 8.
     num_workers : int  DataLoader worker processes.  Default 4.
+    image_size  : int or None  If set, resize CT + masks to ``H=W``.
 
     Returns
     -------
@@ -461,10 +487,11 @@ def create_dataloaders(
 
     for split in ('train', 'val', 'test'):
         ds = CTSliceDataset(
-            data_root  = data_root,
-            masks_root = masks_root,
-            split      = split,
-            augment    = (split == 'train'),
+            data_root    = data_root,
+            masks_root   = masks_root,
+            split        = split,
+            augment      = (split == 'train'),
+            target_size  = image_size,
         )
         loaders[split] = DataLoader(
             ds,
@@ -688,4 +715,3 @@ if __name__ == '__main__':
     print("=" * 60)
     print("All tests PASSED")
     print("=" * 60)
-```

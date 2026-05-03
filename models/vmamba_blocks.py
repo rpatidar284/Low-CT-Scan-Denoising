@@ -23,6 +23,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 # DropPath (stochastic depth) — from timm.
 # Stochastic depth randomly drops entire residual branches during training,
@@ -194,13 +195,14 @@ class SS2D(nn.Module):
     Input / Output: [B, H, W, C]  (BHWC)
     """
 
-    def __init__(self, d_model: int, d_state: int = 16):
+    def __init__(self, d_model: int, d_state: int = 8):
         super().__init__()
         self.d_model    = d_model
         self.d_state    = d_state
         self.A_log      = nn.Parameter(torch.rand(d_model, d_state))
         self.D          = nn.Parameter(torch.ones(d_model))
         self.delta_proj = nn.Linear(d_model, d_model, bias=True)
+        self.delta_proj._preserve_dt_bias = True   # VMUNet global init must not zero this
         self.B_proj     = nn.Linear(d_model, d_state,  bias=False)
         self.C_proj     = nn.Linear(d_model, d_state,  bias=False)
         self.out_proj   = nn.Linear(d_model, d_model,  bias=False)
@@ -278,10 +280,18 @@ class VSSD(nn.Module):
     Forward + backward pass on each of two spatial axes gives every pixel
     full non-causal context from all other pixels simultaneously.
 
+    Parallel cumsum scan runs in chunks of ``SCAN_CHUNK`` positions (vectorised
+    ``cumsum`` inside each chunk). During training, each chunk is wrapped in
+    ``torch.utils.checkpoint`` so backward recomputes chunk internals instead
+    of storing activations for every chunk — critical when ``L = H×W`` is large.
+
     Input / Output: [B, H, W, C]  (BHWC)
     """
 
-    def __init__(self, d_model: int, d_state: int = 16):
+    # Smaller chunks × checkpoint → lower peak VRAM inside each segment.
+    SCAN_CHUNK: int = 128
+
+    def __init__(self, d_model: int, d_state: int = 8):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
@@ -294,6 +304,7 @@ class VSSD(nn.Module):
         )
         self.D          = nn.Parameter(torch.ones(d_model))
         self.delta_proj = nn.Linear(d_model, d_model, bias=True)
+        self.delta_proj._preserve_dt_bias = True   # VMUNet global init must not zero this
         self.B_proj     = nn.Linear(d_model, d_state,  bias=False)
         self.C_proj     = nn.Linear(d_model, d_state,  bias=False)
         self.out_proj   = nn.Linear(d_model, d_model,  bias=False)
@@ -309,23 +320,83 @@ class VSSD(nn.Module):
             self.delta_proj.bias.copy_(torch.log(torch.expm1(dt)))
         nn.init.uniform_(self.out_proj.weight, -0.02, 0.02)
 
+    def _scan_chunk_fwd(self, h_carry: torch.Tensor, xc: torch.Tensor):
+        """
+        One sequence chunk of the parallel SSM scan (see ``_ssm_scan``).
+
+        Kept separate so each chunk can be checkpoint-wrapped during training.
+
+        Parameters
+        ----------
+        h_carry : [B, C, S]
+            Hidden state entering this chunk (zeros at sequence start).
+        xc : [B, L_chunk, C]
+
+        Returns
+        -------
+        y : [B, L_chunk, C]
+        h_next : [B, C, S]  last-step hidden state for the next chunk
+        """
+        A_neg = -F.softplus(self.A_log.to(dtype=xc.dtype))
+        D_vec = self.D.to(dtype=xc.dtype)
+
+        delta = F.softplus(self.delta_proj(xc))
+        Bs = self.B_proj(xc)
+        Cs = self.C_proj(xc)
+
+        dA = torch.exp(
+            delta.unsqueeze(-1) * A_neg.unsqueeze(0).unsqueeze(0)
+        )
+        dB_u = (
+            delta.unsqueeze(-1)
+            * Bs.unsqueeze(2)
+            * xc.unsqueeze(-1)
+        )
+
+        log_dA = torch.log(dA.clamp(min=1e-38))
+        A_cumsum = torch.cumsum(log_dA, dim=1)
+        dB_u_scaled = dB_u * torch.exp(-A_cumsum)
+        inner = torch.cumsum(dB_u_scaled, dim=1)
+        h = torch.exp(A_cumsum) * (h_carry.unsqueeze(1) + inner)
+
+        y = (Cs.unsqueeze(2) * h).sum(-1)
+        y = y + D_vec.unsqueeze(0).unsqueeze(0) * xc
+
+        return y, h[:, -1, :, :]
+
     def _ssm_scan(self, x_seq: torch.Tensor) -> torch.Tensor:
-        B_batch, L, C = x_seq.shape
-        A_neg  = -F.softplus(self.A_log.to(dtype=x_seq.dtype))
-        delta  = F.softplus(self.delta_proj(x_seq))
-        B_seq  = self.B_proj(x_seq)
-        C_seq  = self.C_proj(x_seq)
-        h      = torch.zeros(B_batch, C, self.d_state,
-                             device=x_seq.device, dtype=x_seq.dtype)
+        """
+        Chunked parallel SSM scan along sequence dim.
+
+        Training: each chunk runs under gradient checkpointing so autograd does
+        not retain cumscan intermediates for every segment at once.
+
+        x_seq : [B, L, C]
+        Returns: y_seq [B, L, C]
+        """
+        B, L, C = x_seq.shape
+
+        h_carry = x_seq.new_zeros(B, C, self.d_state)
         ys = []
-        for t in range(L):
-            dA = torch.exp(delta[:, t, :].unsqueeze(-1) * A_neg.unsqueeze(0))
-            dB = delta[:, t, :].unsqueeze(-1) * B_seq[:, t, :].unsqueeze(1)
-            h  = dA * h + dB * x_seq[:, t, :].unsqueeze(-1)
-            y  = (C_seq[:, t, :].unsqueeze(1) * h).sum(-1)
-            y  = y + self.D * x_seq[:, t, :]
-            ys.append(y)
-        return torch.stack(ys, dim=1)
+        ckpt = self.training and torch.is_grad_enabled()
+
+        for start in range(0, L, self.SCAN_CHUNK):
+            end = min(start + self.SCAN_CHUNK, L)
+            xc = x_seq[:, start:end]
+
+            if ckpt:
+                y_c, h_carry = checkpoint(
+                    self._scan_chunk_fwd,
+                    h_carry,
+                    xc,
+                    use_reentrant=False,
+                )
+            else:
+                y_c, h_carry = self._scan_chunk_fwd(h_carry, xc)
+
+            ys.append(y_c)
+
+        return torch.cat(ys, dim=1)
 
     def _bidirectional_scan(self, x_seq: torch.Tensor) -> torch.Tensor:
         y_fwd = self._ssm_scan(x_seq)
@@ -420,7 +491,7 @@ class VSSBlock(nn.Module):
     Parameters
     ----------
     d_model   : int    Channel dimension C at this scale.
-    d_state   : int    VSSD hidden state dimension (default 16).
+    d_state   : int    VSSD hidden state dimension (default 8).
     drop_path : float  Stochastic depth drop probability (default 0.0).
 
     Shape
@@ -439,7 +510,7 @@ class VSSBlock(nn.Module):
     def __init__(
         self,
         d_model:   int,
-        d_state:   int   = 16,
+        d_state:   int   = 8,
         drop_path: float = 0.0,
     ):
         super().__init__()

@@ -27,6 +27,7 @@ Reference: Architecture.pdf – Chapter 8 (VM-UNet / Stage 1)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 try:
     # Works when running as a package/module:
@@ -39,20 +40,38 @@ except ModuleNotFoundError:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Internal helper: build a Sequential of VSSBlocks with per-block drop-path rates
+# Internal helper: VSS stages with optional gradient checkpointing per block
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+class _CheckpointedVSSStage(nn.Module):
+    """Runs each ``VSSBlock`` under ``checkpoint`` during training (saves VRAM)."""
+
+    def __init__(self, blocks):
+        super().__init__()
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for blk in self.blocks:
+            if self.training and torch.is_grad_enabled():
+                x = checkpoint(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)
+        return x
+
 
 def _make_vss_layer_with_rates(
     d_model:  int,
     depth:    int,
     d_state:  int,
     dp_rates: list,
-) -> nn.Sequential:
+) -> nn.Module:
     assert len(dp_rates) == depth
-    return nn.Sequential(
-        *[VSSBlock(d_model=d_model, d_state=d_state, drop_path=dp_rates[i])
-          for i in range(depth)]
-    )
+    blocks = [
+        VSSBlock(d_model=d_model, d_state=d_state, drop_path=dp_rates[i])
+        for i in range(depth)
+    ]
+    return _CheckpointedVSSStage(blocks)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -63,7 +82,7 @@ class VMUNetEncoder(nn.Module):
     """
     VM-UNet Encoder — 4-scale hierarchical feature extractor.
 
-    Input:  [B, 1, 512, 512]   BCHW
+    Input:  [B, 1, H, W]   BCHW  (H, W divisible by patch_size × merges)
     Output:
       bottleneck : [B, 768, 16, 16]   BCHW  ("F" for BYOL)
       skips      : [skip1, skip2, skip3]  all BCHW
@@ -78,7 +97,7 @@ class VMUNetEncoder(nn.Module):
         embed_dim:      int   = 96,
         depths:         list  = None,
         patch_size:     int   = 4,
-        d_state:        int   = 16,
+        d_state:        int   = 8,
         drop_path_rate: float = 0.1,
     ):
         super().__init__()
@@ -129,7 +148,8 @@ class VMUNetEncoder(nn.Module):
     def _init_weights(m):
         if isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
+            # VSSD / SS2D set Δt via delta_proj.bias — overwriting breaks scans.
+            if m.bias is not None and not getattr(m, '_preserve_dt_bias', False):
                 nn.init.zeros_(m.bias)
         elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
             nn.init.ones_(m.weight)
@@ -305,7 +325,7 @@ class VMUNetDecoder(nn.Module):
     ----------
     embed_dim : int        Channel count at Scale 1 (default 96).
     depths    : list[int]  VSSBlocks per decoder stage [s3, s2, s1] (default [2,2,2]).
-    d_state   : int        Mamba state dimension (default 16).
+    d_state   : int        Mamba state dimension (default 8).
     drop_path_rate : float Maximum stochastic-depth rate (default 0.1).
     """
 
@@ -313,7 +333,7 @@ class VMUNetDecoder(nn.Module):
         self,
         embed_dim:      int   = 96,
         depths:         list  = None,
-        d_state:        int   = 16,
+        d_state:        int   = 8,
         drop_path_rate: float = 0.1,
     ):
         super().__init__()
@@ -361,7 +381,7 @@ class VMUNetDecoder(nn.Module):
     def _init_weights(m):
         if isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
+            if m.bias is not None and not getattr(m, '_preserve_dt_bias', False):
                 nn.init.zeros_(m.bias)
         elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
             nn.init.ones_(m.weight)
@@ -437,7 +457,7 @@ class VMUNet(nn.Module):
                          dec_s3, dec_s2, dec_s1]  (7 entries).
                   Default [2,2,2,2, 2,2,2].
     patch_size  : int   PatchEmbed stride (4).
-    d_state     : int   Mamba hidden-state size (16).
+    d_state     : int   Mamba hidden-state size (default 8).
     drop_path_rate: float  Max stochastic-depth rate (0.1).
 
     Examples
@@ -457,7 +477,7 @@ class VMUNet(nn.Module):
         embed_dim:      int   = 96,
         depths:         list  = None,
         patch_size:     int   = 4,
-        d_state:        int   = 16,
+        d_state:        int   = 8,
         drop_path_rate: float = 0.1,
     ):
         super().__init__()

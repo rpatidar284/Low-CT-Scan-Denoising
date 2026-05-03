@@ -153,11 +153,14 @@ class Stage1Model(nn.Module):
 
     def __init__(
         self,
-        in_channels:      int  = 1,
-        num_classes:      int  = 7,
-        embed_dim:        int  = 96,
-        depths:           list = None,
-        byol_feature_dim: int  = 768,
+        in_channels:       int    = 1,
+        num_classes:       int    = 7,
+        embed_dim:         int    = 96,
+        depths:            list   = None,
+        byol_feature_dim:  int    = 768,
+        patch_size:        int    = 4,
+        d_state:           int    = 8,
+        drop_path_rate:    float  = 0.1,
     ):
         super().__init__()
 
@@ -168,10 +171,13 @@ class Stage1Model(nn.Module):
         backbone_depths = list(depths) + list(reversed(depths[:3]))
 
         self.backbone = VMUNet(
-            in_channels = in_channels,
-            num_classes = num_classes,
-            embed_dim   = embed_dim,
-            depths      = backbone_depths,
+            in_channels      = in_channels,
+            num_classes      = num_classes,
+            embed_dim        = embed_dim,
+            depths           = backbone_depths,
+            patch_size       = patch_size,
+            d_state          = d_state,
+            drop_path_rate   = drop_path_rate,
         )
 
         self.byol = BYOLModule(feature_dim=byol_feature_dim)

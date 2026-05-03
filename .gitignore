@@ -9,6 +9,8 @@ logs/
 # checkpoints
 *.pth
 *.pt
+checkpoints/
+
 
 # cache
 __pycache__/

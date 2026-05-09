@@ -114,7 +114,7 @@ training:
   weight_decay:  0.01      # L2 regularisation coefficient
 
   # ── Schedule ──────────────────────────────────────────────────────────────
-  total_steps:  30000      # total gradient update steps (smaller runs train faster)
+  total_steps:  20000      # total gradient update steps (smaller runs train faster)
   warmup_steps: 500        # linear LR warmup from 0 → learning_rate
 
   # After warmup, use cosine annealing: LR decays from learning_rate → 0

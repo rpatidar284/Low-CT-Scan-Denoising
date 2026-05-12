@@ -289,7 +289,7 @@ class VSSD(nn.Module):
     """
 
     # Smaller chunks × checkpoint → lower peak VRAM inside each segment.
-    SCAN_CHUNK: int = 128
+    SCAN_CHUNK: int = 64
 
     def __init__(self, d_model: int, d_state: int = 8):
         super().__init__()

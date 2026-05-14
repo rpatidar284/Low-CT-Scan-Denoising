@@ -110,7 +110,7 @@ training:
   # which is mathematically correct and outperforms vanilla Adam for
   # Transformer / Mamba-based networks.
   optimizer:     adamw
-  learning_rate: 1.0e-4    # peak LR after linear warmup
+  learning_rate: 3.0e-5    # peak LR after linear warmup (lowered from 1.0e-4 for stability)
   weight_decay:  0.01      # L2 regularisation coefficient
 
   # ── Schedule ──────────────────────────────────────────────────────────────

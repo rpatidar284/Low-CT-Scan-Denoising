@@ -126,6 +126,21 @@ def infinite_loader(dataloader):
             yield batch
 
 
+def check_model_weights(model: nn.Module, step: int, logger: logging.Logger) -> bool:
+    """
+    Returns True if any parameter contains NaN or Inf.
+    Call this every 100 steps to catch weight corruption early.
+    """
+    for name, param in model.named_parameters():
+        if param is not None and not torch.isfinite(param).all():
+            logger.error(
+                f"Step {step} | NaN/Inf detected in weights: {name} "
+                f"— training is corrupted. Stop and resume from checkpoint."
+            )
+            return True
+    return False
+
+
 def _log_train_line(msg: str) -> None:
     """Print without breaking tqdm progress bar when tqdm is installed."""
     if _tqdm is not None:
@@ -649,6 +664,7 @@ def train_stage1(
     running_byol_loss = 0.0
     running_steps     = 0
     t0                = time.time()
+    nan_count         = 0  # Track consecutive NaN losses
 
     logger.info(f"Training start | BYOL active from epoch {byol_start_epoch}")
 
@@ -691,11 +707,37 @@ def train_stage1(
                 loss       = loss + byol_weight * l_byol
                 l_byol_val = l_byol.item()
 
+            # ── NaN guard BEFORE backward ──────────────────────────────
+            if not torch.isfinite(loss):
+                logger.warning(
+                    f"Step {step} | Non-finite loss={loss.item():.6f} "
+                    f"— skipping batch, zeroing gradients"
+                )
+                optimizer.zero_grad()
+                nan_count += 1
+                if nan_count >= 3:
+                    logger.error(
+                        "3 consecutive NaN losses — weights are corrupted. "
+                        "Stopping training. Resume from last checkpoint."
+                    )
+                    raise RuntimeError("NaN loss: weights corrupted.")
+                continue
+            nan_count = 0  # reset on healthy step
+            # ── end NaN guard ──────────────────────────────────────────
+
             # ── Backward ──────────────────────────────────────────────
             loss.backward()
 
-            # Gradient clipping prevents exploding gradients in Mamba layers
-            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+            # Clip gradients — prevents exploding gradients from bad batches
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=1.0
+            )
+
+            # Log if grad norm is very high (early warning of instability)
+            if grad_norm > 10.0:
+                logger.warning(
+                    f"Step {step} | High grad norm={grad_norm:.2f} — clipped to 1.0"
+                )
 
             optimizer.step()
             scheduler.step()
@@ -735,6 +777,13 @@ def train_stage1(
                     f"Step {step:6d} | ep={epoch:3d} | L_seg={avg_seg:.4f}{byol_str} | "
                     f"lr={lr:.2e} | {sec_per_step:.2f}s/step"
                 )
+
+                # Check for weight corruption every 100 steps
+                if check_model_weights(model, step, logger):
+                    raise RuntimeError(
+                        f"Corrupted weights at step {step}. "
+                        f"Resume from last checkpoint."
+                    )
 
                 # Reset running stats
                 running_seg_loss  = 0.0

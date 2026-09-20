@@ -23,7 +23,6 @@ if str(_root) not in sys.path:
 
 from models.stage1 import load_stage1_frozen
 from models.stage2 import Stage2Model
-from models.vssd_denoiser import _build_S_scales
 from datapy.dataset import CTSliceDataset, load_slice
 from utils.metrics import compute_psnr, compute_ssim, compute_rmse
 
@@ -105,11 +104,7 @@ def test_pipeline(patient_id, stage1_path, stage2_path, output_dir, ddim_steps=5
         hdct_t = hdct_t.to(device)
         ldct_t = ldct_t.to(device)
 
-        # Stage 1 → anatomy conditioning from LDCT
-        with torch.no_grad():
-            S, e_a = stage1.get_anatomy_conditioning(ldct_t)
-
-        # Stage 2 → denoise
+        # Stage 2 internally runs frozen Stage 1 → S, e_a from the raw LDCT.
         with torch.no_grad():
             out = stage2(ldct_t, mode='inference')
             x_denoised = out['x_denoised']

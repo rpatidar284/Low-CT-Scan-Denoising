@@ -22,6 +22,7 @@ if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
 from models.stage2 import Stage2Model
+from losses.stage2_losses import Stage2LossManager
 from datapy.dataset import CTSliceDataset, DummyCTDataset
 from utils.metrics import compute_psnr, compute_ssim, compute_rmse
 
@@ -110,7 +111,9 @@ class EMAModel(nn.Module):
 @torch.no_grad()
 def _validate(model, ema_model, val_loader, device, max_batches, step, epoch, logger, diffusion):
     """Use EMA model for validation with DDIM sampling."""
-    model.eval()
+    # Only the denoiser is toggled — Stage 1 must stay in eval mode.
+    model.denoiser.eval()
+    model.stage1.eval()
 
     # Copy EMA weights into model for inference
     if ema_model:
@@ -140,7 +143,7 @@ def _validate(model, ema_model, val_loader, device, max_batches, step, epoch, lo
             if n in backup:
                 p.data.copy_(backup[n])
 
-    model.train()
+    model.denoiser.train()
     if psnrs:
         logger.info(f"Step {step:6d} | Val PSNR={sum(psnrs)/len(psnrs):.1f} dB | SSIM={sum(ssims)/len(ssims):.4f} | RMSE={sum(rmses)/len(rmses):.4f}")
     return sum(psnrs) / len(psnrs) if psnrs else 0.0
@@ -196,6 +199,10 @@ def train_stage2(
     ema_model = EMAModel(model.denoiser, decay=ema_decay) if ema_decay > 0 else None
     logger.info(f"Denoiser: {sum(p.numel() for p in model.denoiser.parameters())/1e6:.1f}M | EMA: {ema_decay}")
 
+    # Progressive loss schedule: L_res (+ L_noise) → +0.1·L_kd → +0.05·L_anatomy
+    loss_manager = Stage2LossManager()
+    logger.info(f"Loss schedule | phases end at step {loss_manager.PHASE1_END}/{loss_manager.PHASE2_END}")
+
     trainable = list(model.denoiser.parameters())
     optimizer = torch.optim.Adam(trainable, lr=lr, betas=(0.9, 0.99),
                                  weight_decay=weight_decay)
@@ -230,11 +237,24 @@ def train_stage2(
             batch = next(loader_iter)
             ldct = batch['ldct'].to(device, non_blocking=True)
             hdct = batch['ndct'].to(device, non_blocking=True)
+            mask = batch['mask'].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             out = model(ldct, hdct, mode='train')
 
-            loss = res_weight * out['loss_res'] + noise_weight * out['loss_noise']
+            base_loss = res_weight * out['loss_res'] + noise_weight * out['loss_noise']
+
+            # Phase-3 anatomy loss: Stage 1 e_a of the predicted clean image vs
+            # the true HDCT e_a. Stage 1 is frozen but the graph carries gradients
+            # through x_hat into pred_res, so the loss actually shapes denoising.
+            e_a_pred = None
+            if loss_manager._get_phase(step) >= 3 and step % 5 == 0:
+                x_hat = model.predicted_clean(ldct, out['pred_res'])
+                e_a_pred = model.stage1(x_hat, return_byol=False)['e_a']
+
+            loss_dict = loss_manager.compute(step, base_loss, out['kd_logits'], mask,
+                                             e_a_pred, out['e_a'])
+            loss = loss_dict['total']
 
             # NaN guard
             if torch.isnan(loss) or torch.isinf(loss):
@@ -264,7 +284,9 @@ def train_stage2(
             if step % log_every == 0:
                 avg_r = running_r / running_steps; avg_n = running_n / running_steps
                 elapsed = time.time() - t0
-                logger.info(f"Step {step:6d} | ep={epoch:2d} | L_res={avg_r:.4f} | L_noise={avg_n:.4f} | lr={lr_val:.2e} | {elapsed/running_steps:.2f}s/step")
+                kd = loss_dict['loss_kd']
+                kd_str = f" | L_kd={kd.item():.4f}" if kd is not None else ""
+                logger.info(f"Step {step:6d} | ep={epoch:2d} | L_res={avg_r:.4f} | L_noise={avg_n:.4f}{kd_str} | lr={lr_val:.2e} | {elapsed/running_steps:.2f}s/step")
                 running_r = running_n = 0.0; running_steps = 0; t0 = time.time()
 
             if step % val_every == 0:

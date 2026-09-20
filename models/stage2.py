@@ -48,8 +48,15 @@ class Stage2Model(nn.Module):
 
     @torch.no_grad()
     def get_conditioning(self, x):
+        # Stage 1 was trained on [0, 1] CT slices — feed raw images, not the
+        # [-1, 1] diffusion-normalised ones, or the anatomy maps are garbage.
         S, e_a = self.stage1.get_anatomy_conditioning(x)
         return _build_S_scales(S, self.scale_sizes), e_a
+
+    def predicted_clean(self, x_ldct, pred_res):
+        """Reconstruct the clean image in the raw [0, 1] domain from a
+        predicted residual expressed in the diffusion [-1, 1] domain."""
+        return self.diffusion.unnormalize(self.diffusion.normalize(x_ldct) - pred_res)
 
     def forward(self, x_ldct, x_hdct=None, mode='train'):
         B, device = x_ldct.shape[0], x_ldct.device
@@ -57,13 +64,12 @@ class Stage2Model(nn.Module):
         if mode == 'train':
             assert x_hdct is not None
 
-            # Normalize to [-1, 1]
+            # Normalize to [-1, 1] for the diffusion process
             ldct_n = self.diffusion.normalize(x_ldct)
             hdct_n = self.diffusion.normalize(x_hdct)
 
-            # Anatomy from frozen Stage 1 (run on HDCT at train time)
-            with torch.no_grad():
-                S_scales, e_a = self.get_conditioning(hdct_n)
+            # Anatomy from frozen Stage 1 (run on raw HDCT at train time)
+            S_scales, e_a = self.get_conditioning(x_hdct)
 
             x_res = ldct_n - hdct_n
             t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=device).long()
@@ -83,8 +89,8 @@ class Stage2Model(nn.Module):
 
             ldct_n = self.diffusion.normalize(x_ldct.view(B, C, H, W))
 
-            with torch.no_grad():
-                S_scales, e_a = self.get_conditioning(ldct_n)
+            # Stage 1 conditioning runs on the raw [0, 1] LDCT
+            S_scales, e_a = self.get_conditioning(x_ldct.view(B, C, H, W))
 
             shape = (B, C, H, W)
             x_denoised_n = self.diffusion.ddim_sample(self.denoiser, ldct_n, S_scales, e_a, shape)

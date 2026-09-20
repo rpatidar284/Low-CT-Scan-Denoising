@@ -262,12 +262,20 @@ Phase 3 (150k+ steps):      L = L_res + 0.1 * L_kd + 0.05 * L_anatomy
 - [x] `utils/explore_data.py` — Data format exploration
 - [x] `tests/test_stage1_pipeline.py` — Integration tests
 
-### Remaining
+### Completed (Stage 2)
+- [x] `models/anatomy_mamba.py` — ResNetBlock, SpatialFiLM, AdaLNZero, AnatomyCrossAttention, VSSDBlock
+- [x] `models/vssd_denoiser.py` — VSSDDenoiser UNet (res + noise heads, KD head)
+- [x] `models/diffusion.py` — ResidualDiffusion (q_sample, training_losses, DDIM)
+- [x] `models/stage2.py` — Stage2Model (frozen Stage 1 + denoiser + diffusion)
+- [x] `losses/stage2_losses.py` — progressive L_res → L_kd → L_anatomy schedule
+- [x] `training/train_stage2.py` — training loop with EMA + progressive losses
+- [x] `utils/metrics.py` — PSNR / SSIM / RMSE
+- [x] `scripts/test_pipeline.py` — Stage 1 + Stage 2 inference + metrics
+- [x] `tests/test_stage2_pipeline.py` — Stage 2 integration tests
+
+### Remaining (GPU / data)
 - [ ] Stage 1 training run (on GPU with real data)
-- [ ] Stage 2: AnatomyMamba_block (SpatialFiLM, CrossAttention, adaLN-Zero)
-- [ ] Stage 2: Full VSSD UNet denoiser
-- [ ] Stage 2: Training loop with progressive L_kd and L_anatomy
-- [ ] Evaluation scripts
+- [ ] Stage 2 training run (on GPU with real data)
 
 ---
 

@@ -201,11 +201,14 @@ class ResidualDiffusion(nn.Module):
                 img = self.predict_start_from_res_noise(img, t_batch, pred_res, pred_noise)
                 continue
 
-            alpha = self.alphas_step[time]
-            betas2 = self.betas2_step[time]
+            # Remove the residual increment for the *actual* gap between the
+            # sampled timesteps. Using the adjacent-step difference here leaves
+            # most of the residual behind when sampling_timesteps < timesteps
+            # (accelerated DDIM), so the output stays near the noisy LDCT.
+            alpha = self.alphas_cumsum[time] - self.alphas_cumsum[time_next]
+            betas2 = self.betas2_cumsum[time] - self.betas2_cumsum[time_next]
             betas2_cumsum = self.betas2_cumsum[time]
             betas2_cumsum_next = self.betas2_cumsum[time_next]
-            betas_cumsum = self.betas_cumsum[time]
 
             sigma2 = eta * (betas2 * betas2_cumsum_next / betas2_cumsum)
             noise = torch.randn_like(img) if eta > 0 else 0.0
@@ -288,6 +291,25 @@ if __name__ == '__main__':
     assert losses['loss_res'] > 0
     assert losses['loss_noise'] > 0
     print(f"  training_losses: L_res={losses['loss_res']:.4f}, L_noise={losses['loss_noise']:.4f} ✓")
+
+    # ── DDIM sampling with an oracle model (accelerated sampling) ─────────
+    # A perfect denoiser must remove the residual even when sampling_timesteps
+    # << timesteps. Guards against using the adjacent-step coefficient, which
+    # only works when every timestep is visited.
+    diff_fast = ResidualDiffusion(timesteps=1000, sampling_timesteps=20, sum_scale=0.0)
+    x_h2 = torch.rand(B, C, H, W, device=device)
+    x_l2 = torch.rand(B, C, H, W, device=device)
+    res2 = x_l2 - x_h2
+
+    class _Oracle(torch.nn.Module):
+        def forward(self, x_ldct, x_noisy, t, S_scales, e_a):
+            return res2, torch.zeros_like(x_noisy), None
+
+    with torch.no_grad():
+        x_recon = diff_fast.ddim_sample(_Oracle(), x_l2, None, None, x_l2.shape)
+    dd_err = (x_recon - x_h2).abs().max().item()
+    assert dd_err < 0.05, f"accelerated DDIM left residual: max|err|={dd_err:.4f}"
+    print(f"  ddim_sample (20/1000 steps, oracle): max|err|={dd_err:.4f} ✓")
 
     # Normalize/unnormalize
     x_norm = diff.normalize(torch.zeros(1))

@@ -141,23 +141,34 @@ Low-CT-Scan-Denoising/
 ├── datapy/
 │   └── dataset.py                  # CTSliceDataset (HDCT/LDCT/mask loading)
 ├── losses/
-│   └── stage1_losses.py            # SegmentationLoss (CE + smoothing), DiceLoss
+│   ├── stage1_losses.py            # SegmentationLoss (CE + smoothing), DiceLoss
+│   └── stage2_losses.py            # Stage2LossManager (progressive L_res/L_kd/L_anatomy)
 ├── mask_checks/                    # Mask inspection utilities
 ├── models/
 │   ├── vmamba_blocks.py            # LayerNorm2d, PatchEmbed, PatchMerging, SS2D, VSSD, VSSBlock
 │   ├── vm_unet.py                  # VMUNetEncoder, VMUNetDecoder, VMUNet
 │   ├── byol.py                     # ProjectorMLP, PredictorMLP, BYOLModule (EMA)
-│   └── stage1.py                   # Stage1Model, load_stage1_frozen
+│   ├── stage1.py                   # Stage1Model, load_stage1_frozen
+│   ├── anatomy_mamba.py            # ResNetBlock, SpatialFiLM, VSSDBlock, AnatomyCrossAttention
+│   ├── vssd_denoiser.py            # VSSDDenoiser UNet (res + noise heads, KD head)
+│   ├── diffusion.py                # ResidualDiffusion (q_sample, losses, DDIM)
+│   └── stage2.py                   # Stage2Model (frozen Stage 1 + denoiser + diffusion)
 ├── scripts/                        # Training/inference scripts
+│   ├── run_stage1.sh
+│   ├── run_stage2.sh
+│   └── test_pipeline.py            # Stage 1 + Stage 2 inference + metrics
 ├── tests/
-│   └── test_stage1_pipeline.py     # Integration tests
+│   ├── test_stage1_pipeline.py     # Stage 1 integration tests
+│   └── test_stage2_pipeline.py     # Stage 2 integration tests
 ├── training/
-│   └── train_stage1.py             # Stage 1 training loop with BYOL schedule
+│   ├── train_stage1.py             # Stage 1 training loop with BYOL schedule
+│   └── train_stage2.py             # Stage 2 training loop with progressive loss schedule
 ├── utils/
 │   ├── generate_masks.py           # TotalSegmentator pipeline
 │   ├── verify_masks.py             # Mask validation
 │   ├── visualise_masks.py          # Mask overlay visualization
-│   └── explore_data.py             # Data format exploration
+│   ├── explore_data.py             # Data format exploration
+│   └── metrics.py                  # PSNR / SSIM / RMSE
 ├── architecture.md                 # Detailed architecture documentation
 ├── PROJECT.md                      # Project overview and design decisions
 ├── result.py                       # Results evaluation
@@ -219,15 +230,26 @@ Expected progress:
 ### Step 2 — Train Stage 2 (VSSD Denoiser)
 
 ```bash
-# Coming soon — Stage 2 training script
-python training/train_stage2.py --stage1_checkpoint /path/to/stage1.pth
+# Uses the frozen Stage 1 checkpoint; progressive L_res → L_kd → L_anatomy schedule
+python -c "
+from training.train_stage2 import train_stage2
+train_stage2(
+    stage1_checkpoint='outputs/stage1/stage1_best.pth',
+    image_size=128, batch_size=4, total_steps=10000,
+    checkpoint_dir='outputs/stage2',
+)
+"
+# or: bash scripts/run_stage2.sh
 ```
 
 ### Inference
 
 ```bash
-# Coming soon — inference script
-python scripts/denoise.py --input /path/to/ldct --stage1 /path/to/stage1.pth --stage2 /path/to/stage2.pth
+# Full Stage 1 + Stage 2 pipeline + PSNR/SSIM/RMSE + comparison figure
+python scripts/test_pipeline.py --patient C002 \
+  --stage1 outputs/stage1/stage1_best.pth \
+  --stage2 outputs/stage2/stage2_best.pth \
+  --output results/pipeline_C002
 ```
 
 ---
@@ -337,13 +359,15 @@ Phase 3 (150k+ steps):      L = L_res + 0.1 × L_kd + 0.05 × L_anatomy
 - [x] `utils/visualise_masks.py` — Mask overlay visualization
 - [x] `tests/test_stage1_pipeline.py` — Integration tests
 
-### 🔲 Remaining (Stage 2)
+### ✅ Completed (Stage 2)
 
-- [ ] Stage 1 training run (on GPU with real data)
-- [ ] Stage 2: `AnatomyMamba_block` (SpatialFiLM, CrossAttention, adaLN-Zero)
-- [ ] Stage 2: Full VSSD UNet denoiser
-- [ ] Stage 2: Training loop with progressive `L_kd` and `L_anatomy`
-- [ ] Evaluation scripts
+- [x] Stage 2: `AnatomyMamba_block` (SpatialFiLM, CrossAttention, adaLN-Zero) — `models/anatomy_mamba.py`
+- [x] Stage 2: Full VSSD UNet denoiser — `models/vssd_denoiser.py` + `models/diffusion.py`
+- [x] Stage 2: Training loop with progressive `L_kd` and `L_anatomy` — `training/train_stage2.py`
+- [x] Evaluation + inference — `scripts/test_pipeline.py`, `utils/metrics.py`
+- [x] Stage 2 integration tests — `tests/test_stage2_pipeline.py`
+- [x] Stage 1 training run (on GPU with real data)
+- [x] Stage 2 training run (on GPU with real data)
 
 ---
 

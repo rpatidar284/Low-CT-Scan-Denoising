@@ -424,5 +424,5 @@ This project is for research and educational purposes.
 ## Acknowledgements
 
 - [VMamba](https://github.com/MzeroMiko/VMamba) — Visual State Space Model
-- [TotalSegmentator](https://github.com/wasserth/TotalSegmentator) — CT organ segmentation
+- [TotalSegmentator](https://github.com/wasserth/TotalSegmentator) — Computed Tomography organ segmentation
 - [BYOL](https://arxiv.org/abs/2006.07733) — Bootstrap Your Own Latent
